@@ -975,8 +975,7 @@ static ArtMethod* ResolveMethod(uint16_t method_idx,
     *imt_or_vtable_index = ImTable::GetImtIndex(resolved_method);
   }
 
-  *is_string_constructor =
-      resolved_method->IsConstructor() && resolved_method->GetDeclaringClass()->IsStringClass();
+  *is_string_constructor = resolved_method->IsStringConstructor();
 
   return resolved_method;
 }
