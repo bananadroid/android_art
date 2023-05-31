@@ -1532,37 +1532,30 @@ void Heap::ThrowOutOfMemoryError(Thread* self, size_t byte_count, AllocatorType 
 }
 
 void Heap::DoPendingCollectorTransition() {
-  CollectorType desired_collector_type = desired_collector_type_;
+  const CollectorType desired_collector_type = desired_collector_type_;
+  const size_t num_bytes_allocated_since_gc = UnsignedDifference(GetBytesAllocated(), num_bytes_alive_after_gc_);
+  const size_t target_threshold = UnsignedDifference(target_footprint_.load(std::memory_order_relaxed), num_bytes_alive_after_gc_) / 4;
 
   if (collector_type_ == kCollectorTypeCC) {
-    // App's allocations (since last GC) more than the threshold then do TransitionGC
-    // when the app was in background. If not, then don't do TransitionGC.
-    size_t num_bytes_allocated_since_gc =
-        UnsignedDifference(GetBytesAllocated(), num_bytes_alive_after_gc_);
-    size_t threshold = UnsignedDifference(target_footprint_.load(std::memory_order_relaxed), num_bytes_alive_after_gc_) / 4;
+    const size_t available_memory = GetMaxMemory();
+    const size_t percent_free = static_cast<size_t>(100.0f * static_cast<float>(GetFreeMemory()) / available_memory);
+    const size_t total_memory = GetTotalMemory();
 
-    if (num_bytes_allocated_since_gc >= threshold || kStressCollectorTransition || IsLowMemoryMode()) {
-      // Launch homogeneous space compaction if it is desired.
-      if (desired_collector_type == kCollectorTypeHomogeneousSpaceCompact) {
-        if (!CareAboutPauseTimes()) {
-          PerformHomogeneousSpaceCompact();
-        } else {
-          VLOG(gc) << "Homogeneous compaction ignored due to jank perceptible process state";
-        }
-      } else if (desired_collector_type == kCollectorTypeCCBackground) {
-        DCHECK(gUseReadBarrier);
-        if (!CareAboutPauseTimes()) {
-          // Invoke CC full compaction.
-          CollectGarbageInternal(collector::kGcTypeFull,
-                                 kGcCauseCollectorTransition,
-                                 /*clear_soft_references=*/false, GetCurrentGcNum() + 1);
-        } else {
-          VLOG(gc) << "CC background compaction ignored due to jank perceptible process state";
-        }
-      } else {
-        CHECK_EQ(desired_collector_type, collector_type_) << "Unsupported collector transition";
-      }
+    const size_t fraction = static_cast<size_t>(std::log2(total_memory / (1ull << 30))) + 1;
+    const size_t adjusted_threshold = target_threshold >> fraction;
+
+    if (num_bytes_allocated_since_gc < adjusted_threshold && percent_free >= 50 && !kStressCollectorTransition && !IsLowMemoryMode()) {
+      return;
     }
+  }
+
+  if (desired_collector_type == kCollectorTypeHomogeneousSpaceCompact && !CareAboutPauseTimes() && !IsLowMemoryMode()) {
+    PerformHomogeneousSpaceCompact();
+  } else if (desired_collector_type == kCollectorTypeCCBackground && !CareAboutPauseTimes() && !IsLowMemoryMode()) {
+    DCHECK(gUseReadBarrier);
+    CollectGarbageInternal(collector::kGcTypeFull, kGcCauseCollectorTransition, /*clear_soft_references=*/false, GetCurrentGcNum() + 1);
+  } else {
+    LOG(ERROR) << "Unsupported collector transition: " << desired_collector_type;
   }
 }
 
@@ -4648,43 +4641,50 @@ static uint32_t GetPseudoRandomFromUid() {
 void Heap::PostForkChildAction(Thread* self) {
   uint32_t starting_gc_num = GetCurrentGcNum();
   uint64_t last_adj_time = NanoTime();
-  next_gc_type_ = NonStickyGcType();  // Always start with a full gc.
+  next_gc_type_ = NonStickyGcType();  // Always start with a full GC.
 
   LOG(INFO) << "Using " << foreground_collector_type_ << " GC.";
   if (gUseUserfaultfd) {
     DCHECK_NE(mark_compact_, nullptr);
-    mark_compact_->CreateUserfaultfd(/*post_fork*/true);
+    mark_compact_->CreateUserfaultfd(/*post_fork*/ true);
   }
 
   // Temporarily increase target_footprint_ and concurrent_start_bytes_ to
   // max values to avoid GC during app launch.
   // Set target_footprint_ to the largest allowed value.
-  SetIdealFootprint(growth_limit_);
+  SetIdealFootprint(GetMaxMemory());
   SetDefaultConcurrentStartBytes();
 
-  // Shrink heap after kPostForkMaxHeapDurationMS, to force a memory hog process to GC.
-  // This remains high enough that many processes will continue without a GC.
-  if (initial_heap_size_ < growth_limit_) {
-    size_t first_shrink_size = std::max(growth_limit_ / 4, initial_heap_size_);
+  // Calculate the dynamic threshold based on the total memory
+  const size_t total_memory = GetTotalMemory();
+
+  // Calculate the adjusted threshold based on the target threshold and fraction
+  const size_t target_threshold = UnsignedDifference(target_footprint_.load(std::memory_order_relaxed), num_bytes_alive_after_gc_) / 4;
+  const size_t fraction = static_cast<size_t>(std::log2(total_memory / (1ull << 30))) + 1;
+  const size_t adjusted_threshold = target_threshold >> fraction;
+
+  // Trigger GC if the allocation exceeds the adjusted threshold and percent free is below the dynamic threshold
+  const size_t num_bytes_allocated_since_gc = UnsignedDifference(GetBytesAllocated(), num_bytes_alive_after_gc_);
+  const size_t percent_free = static_cast<size_t>(100.0f * static_cast<float>(GetFreeMemory()) / std::max(target_footprint_.load(std::memory_order_relaxed), GetBytesAllocated()));
+  const bool should_trigger_gc = (num_bytes_allocated_since_gc >= adjusted_threshold) && (percent_free < 50);
+
+  if (should_trigger_gc) {
+    // Shrink the heap after a substantial time period
+    const size_t first_shrink_size = std::max(GetMaxMemory() / 4, initial_heap_size_);
+    const size_t second_shrink_size = initial_heap_size_;
+
     last_adj_time += MsToNs(kPostForkMaxHeapDurationMS);
-    GetTaskProcessor()->AddTask(
-        self, new ReduceTargetFootprintTask(last_adj_time, first_shrink_size, starting_gc_num));
-    // Shrink to a small value after a substantial time period. This will typically force a
-    // GC if none has occurred yet. Has no effect if there was a GC before this anyway, which
-    // is commonly the case, e.g. because of a process transition.
+    GetTaskProcessor()->AddTask(self, new ReduceTargetFootprintTask(last_adj_time, first_shrink_size, starting_gc_num));
+
     if (initial_heap_size_ < first_shrink_size) {
       last_adj_time += MsToNs(4 * kPostForkMaxHeapDurationMS);
-      GetTaskProcessor()->AddTask(
-          self,
-          new ReduceTargetFootprintTask(last_adj_time, initial_heap_size_, starting_gc_num));
+      GetTaskProcessor()->AddTask(self, new ReduceTargetFootprintTask(last_adj_time, second_shrink_size, starting_gc_num));
     }
   }
-  // Schedule a GC after a substantial period of time. This will become a no-op if another GC is
-  // scheduled in the interim. If not, we want to avoid holding onto start-up garbage.
-  uint64_t post_fork_gc_time = last_adj_time
-      + MsToNs(4 * kPostForkMaxHeapDurationMS + GetPseudoRandomFromUid());
-  GetTaskProcessor()->AddTask(self,
-                              new TriggerPostForkCCGcTask(post_fork_gc_time, starting_gc_num));
+
+  // Schedule a GC after a substantial period of time
+  uint64_t post_fork_gc_time = last_adj_time + MsToNs(4 * kPostForkMaxHeapDurationMS + GetPseudoRandomFromUid());
+  GetTaskProcessor()->AddTask(self, new TriggerPostForkCCGcTask(post_fork_gc_time, starting_gc_num));
 }
 
 void Heap::VisitReflectiveTargets(ReflectiveValueVisitor *visit) {
