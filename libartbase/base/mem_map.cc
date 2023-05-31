@@ -1263,7 +1263,7 @@ void ZeroPages(void* address, size_t length, bool release_memory) {
 
   if (!kMadviseZeroes || page_begin >= page_end) {
     // No possible area to madvise.
-    std::fill(mem_begin, mem_end, 0);
+    memset(mem_begin, 0, length);
   } else {
     // Spans one or more pages.
     DCHECK_LE(mem_begin, page_begin);
@@ -1273,18 +1273,36 @@ void ZeroPages(void* address, size_t length, bool release_memory) {
 #ifdef _WIN32
     UNUSED(release_memory);
     LOG(WARNING) << "ZeroPages does not madvise on Windows.";
-    std::fill(mem_begin, mem_end, 0);
+    memset(mem_begin, 0, length);
 #else
     if (release_memory) {
-      std::fill(mem_begin, page_begin, 0);
-      std::fill(page_end, mem_end, 0);
+      memset(mem_begin, 0, page_begin - mem_begin);
+      memset(page_end, 0, mem_end - page_end);
 
 #ifdef MADV_DONTNEED
-      bool res = madvise(page_begin, page_end - page_begin, MADV_DONTNEED);
-      CHECK_NE(res, -1) << "madvise failed";
+      // Calculate the aligned page sizes
+      size_t page_size = page_end - page_begin;
+      size_t aligned_page_size = (page_size / kPageSize) * kPageSize;
+      size_t remainder_size = page_size % kPageSize;
+
+      // Discard the aligned pages using MADV_DONTNEED
+      if (aligned_page_size > 0) {
+        bool res = madvise(page_begin, aligned_page_size, MADV_DONTNEED);
+        CHECK_NE(res, -1) << "madvise failed";
+      }
+
+      // Zero and discard the remaining pages individually
+      for (size_t offset = aligned_page_size; offset < page_size; offset += kPageSize) {
+        memset(page_begin + offset, 0, kPageSize);
+        bool res = madvise(page_begin + offset, kPageSize, MADV_DONTNEED);
+        CHECK_NE(res, -1) << "madvise failed";
+      }
+
+      // Zero the remaining portion of the last page
+      memset(page_end - remainder_size, 0, remainder_size);
 #endif
     } else {
-      std::fill(mem_begin, mem_end, 0);
+      memset(mem_begin, 0, length);
     }
 #endif
   }
