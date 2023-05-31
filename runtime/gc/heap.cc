@@ -1536,39 +1536,33 @@ void Heap::DoPendingCollectorTransition() {
 
   if (collector_type_ == kCollectorTypeCC) {
     // App's allocations (since last GC) more than the threshold then do TransitionGC
-    // when the app was in background. If not then don't do TransitionGC.
-    // num_bytes_allocated_since_gc should always be positive even if initially
-    // num_bytes_alive_after_gc_ is coming from Zygote. This gives positive or zero value.
+    // when the app was in background. If not, then don't do TransitionGC.
     size_t num_bytes_allocated_since_gc =
         UnsignedDifference(GetBytesAllocated(), num_bytes_alive_after_gc_);
-    if (num_bytes_allocated_since_gc <
-        (UnsignedDifference(target_footprint_.load(std::memory_order_relaxed),
-                            num_bytes_alive_after_gc_)/4)
-        && !kStressCollectorTransition
-        && !IsLowMemoryMode()) {
-      return;
-    }
-  }
+    size_t threshold = UnsignedDifference(target_footprint_.load(std::memory_order_relaxed), num_bytes_alive_after_gc_) / 4;
 
-  // Launch homogeneous space compaction if it is desired.
-  if (desired_collector_type == kCollectorTypeHomogeneousSpaceCompact) {
-    if (!CareAboutPauseTimes()) {
-      PerformHomogeneousSpaceCompact();
-    } else {
-      VLOG(gc) << "Homogeneous compaction ignored due to jank perceptible process state";
+    if (num_bytes_allocated_since_gc >= threshold || kStressCollectorTransition || IsLowMemoryMode()) {
+      // Launch homogeneous space compaction if it is desired.
+      if (desired_collector_type == kCollectorTypeHomogeneousSpaceCompact) {
+        if (!CareAboutPauseTimes()) {
+          PerformHomogeneousSpaceCompact();
+        } else {
+          VLOG(gc) << "Homogeneous compaction ignored due to jank perceptible process state";
+        }
+      } else if (desired_collector_type == kCollectorTypeCCBackground) {
+        DCHECK(gUseReadBarrier);
+        if (!CareAboutPauseTimes()) {
+          // Invoke CC full compaction.
+          CollectGarbageInternal(collector::kGcTypeFull,
+                                 kGcCauseCollectorTransition,
+                                 /*clear_soft_references=*/false, GetCurrentGcNum() + 1);
+        } else {
+          VLOG(gc) << "CC background compaction ignored due to jank perceptible process state";
+        }
+      } else {
+        CHECK_EQ(desired_collector_type, collector_type_) << "Unsupported collector transition";
+      }
     }
-  } else if (desired_collector_type == kCollectorTypeCCBackground) {
-    DCHECK(gUseReadBarrier);
-    if (!CareAboutPauseTimes()) {
-      // Invoke CC full compaction.
-      CollectGarbageInternal(collector::kGcTypeFull,
-                             kGcCauseCollectorTransition,
-                             /*clear_soft_references=*/false, GetCurrentGcNum() + 1);
-    } else {
-      VLOG(gc) << "CC background compaction ignored due to jank perceptible process state";
-    }
-  } else {
-    CHECK_EQ(desired_collector_type, collector_type_) << "Unsupported collector transition";
   }
 }
 
