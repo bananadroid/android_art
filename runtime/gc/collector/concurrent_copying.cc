@@ -2800,13 +2800,6 @@ void ConcurrentCopying::ReclaimPhase() {
       CHECK_GE(cleared_objects, from_objects);
     }
 
-    // If we need to release available memory to the OS, go over all free
-    // regions which the kernel might still cache.
-    if (should_release_memory) {
-      TimingLogger::ScopedTiming split4("Release free regions", GetTimings());
-      region_space_->ReleaseFreeRegions();
-    }
-
     // freed_bytes could conceivably be negative if we fall back to nonmoving space and have to
     // pad to a larger size.
     int64_t freed_bytes = (int64_t)cleared_bytes - (int64_t)to_bytes;

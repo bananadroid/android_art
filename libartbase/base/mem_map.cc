@@ -1279,22 +1279,12 @@ void ZeroPages(void* address, size_t length, bool release_memory) {
       std::fill(mem_begin, page_begin, 0);
       std::fill(page_end, mem_end, 0);
 
-      // Split the madvise call into smaller chunks
-      const size_t pageSize = static_cast<size_t>(kPageSize);
-      uint8_t* page = page_begin;
-      while (page < page_end) {
-        uint8_t* chunk_end = std::min(page + pageSize, page_end);
-        bool res = madvise(page, chunk_end - page, MADV_DONTNEED);
-        CHECK_NE(res, -1) << "madvise failed";
-        page += pageSize;
-      }
-    } else {
-      std::fill(mem_begin, mem_end, 0);
-
-#ifdef MADV_FREE
-      bool res = madvise(page_begin, page_end - page_begin, MADV_FREE);
+#ifdef MADV_DONTNEED
+      bool res = madvise(page_begin, page_end - page_begin, MADV_DONTNEED);
       CHECK_NE(res, -1) << "madvise failed";
 #endif
+    } else {
+      std::fill(mem_begin, mem_end, 0);
     }
 #endif
   }
