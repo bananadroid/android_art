@@ -1534,14 +1534,15 @@ void Heap::ThrowOutOfMemoryError(Thread* self, size_t byte_count, AllocatorType 
 void Heap::DoPendingCollectorTransition() {
   const CollectorType desired_collector_type = desired_collector_type_;
   const size_t num_bytes_allocated_since_gc = UnsignedDifference(GetBytesAllocated(), num_bytes_alive_after_gc_);
-  const size_t target_threshold = UnsignedDifference(target_footprint_.load(std::memory_order_relaxed), num_bytes_alive_after_gc_) / 4;
+  const size_t target_threshold = UnsignedDifference(target_footprint_.load(std::memory_order_relaxed), num_bytes_alive_after_gc_);
 
   if (collector_type_ == kCollectorTypeCC) {
     const size_t available_memory = GetMaxMemory();
     const size_t percent_free = static_cast<size_t>(100.0f * static_cast<float>(GetFreeMemory()) / available_memory);
     const size_t total_memory = GetTotalMemory();
 
-    const size_t fraction = static_cast<size_t>(std::log2(total_memory / (1ull << 30))) + 1;
+    const size_t shift = std::log2(std::max(total_memory, available_memory) / (1ull << 30));
+    const size_t fraction = shift + 1;
     const size_t adjusted_threshold = target_threshold >> fraction;
 
     if (num_bytes_allocated_since_gc < adjusted_threshold && percent_free >= 50 && !kStressCollectorTransition && !IsLowMemoryMode()) {
@@ -4657,10 +4658,12 @@ void Heap::PostForkChildAction(Thread* self) {
 
   // Calculate the dynamic threshold based on the total memory
   const size_t total_memory = GetTotalMemory();
+  const size_t available_memory = GetMaxMemory();
 
   // Calculate the adjusted threshold based on the target threshold and fraction
-  const size_t target_threshold = UnsignedDifference(target_footprint_.load(std::memory_order_relaxed), num_bytes_alive_after_gc_) / 4;
-  const size_t fraction = static_cast<size_t>(std::log2(total_memory / (1ull << 30))) + 1;
+  const size_t target_threshold = UnsignedDifference(target_footprint_.load(std::memory_order_relaxed), num_bytes_alive_after_gc_);
+  const size_t shift = std::log2(std::max(total_memory, available_memory) / (1ull << 30));
+  const size_t fraction = shift + 1;
   const size_t adjusted_threshold = target_threshold >> fraction;
 
   // Trigger GC if the allocation exceeds the adjusted threshold and percent free is below the dynamic threshold
